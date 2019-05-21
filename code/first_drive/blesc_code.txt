@@ -1,0 +1,913 @@
+;**** A P P L I C A T I O N   N O T E   A V R  ************************
+;* Title:		Brush-less Sensor-less DC motor speed control
+;* Version:		1.2
+;* Last Updated:	02.12.2013
+;*			v1.2 Bug found at maximum power control. ZL timer loop counter made no-power out timing. 
+;*			v1.1 Correct the Low-voltage sense level and add the off timing for photo coupler delay compensation.
+;* Target:		AT90S2313 10MHz 
+;* Author:		Debjyoti Chowdhury
+;* Support E-mail:	djbabai.debjyoti@gmail.com
+;*
+;* DESCRIPTION		This program is for model airplane Brush-less/Sensor-less DC Hi-Power motor control with usual 
+;*			digital proportional radio control interface.
+;*			Also, this program has low-voltage sensing, no-signal sensing with keep-run timer(400mS) and 
+;*			no-signal fail safe function.
+;*			One AT90S2313 can handle all interface lines to drive power FETS, rotor sensing, low voltage and
+;*			radio connection.   
+;*			To discuss this program's detail, system hardware schematic is required.
+;*			Applications are model airplane, boat, hybrid car, home appliance's motor control ...etc.
+;***************************************************************************
+.equ	phase_repeat =128	;Starting repeat time data in TIMER0 interrupt routine.max 255 (Slowest starting speed)
+.equ	duty_max =240		;on-duty timing at maximum power. max. 255
+.equ	phase_max =4		;phase timing at maximum speed. frame frq.=CLK/1/256(40kHz)/this value. Consider sampling law.
+.equ	start_on_duty =64	;used output on-duty timing routine at starting-up 1 phase only. off_duty=255-(start_on_duty). max. 255
+
+
+
+;These values is slightly longer by interrupt machine cycles
+.equ	uS800=125	;too short. 900uS/6.4uS T1 control input pulse width measuring resolution
+.equ	uS1100=173	;1250uS/6.4uS T1 control input pulse width measuring resolution
+.equ	uS1900L=296-255	;1900uS/6.4uS T1 control input pulse width measuring resolution
+.equ	uS2200=343	;too long. 2200uS/6.4uS T1 control input pulse width measuring resolution
+.equ	uS2200L=343-255	;too long. 2200uS/6.4uS T1 lo byte control input pulse width measuring resolution
+
+.equ	hys_hi=20	;hysterisis threshold hi-level of duty data to avoid jitter at starting control input data
+.equ	hys_lo=10	; hysterisis threshold lo-level of duty data to avoid jitter at starting control input data
+
+
+.DSEG			;Start data segment 
+.ORG 0x60		;Set SRAM address to hex 60 
+RAM_DUTY:	.byte 1	; storage for motor power control duty data
+ph_count: 	.byte 1	;phase timing repeat counter for starting slow 3-phase sweep frequency generator
+temp0:		.byte 1	;general scratch space. used mainly in TIM0 data setting. 
+temp3:		.byte 1	;general scratch space
+correct_pulse_width: .byte 1	;flag to test control input pulse width. 0:incorrect, 1:correct
+RAM_TCNT1H: 	.byte 1	;Temp storage space for T1 hi-byte timer data
+RAM_TCNT1L: 	.byte 1	;Temp storage space for T1 lo-byte timer data
+RAM_SHORT: 	.byte 1	;motor off control pulse width data from T1 lo-byte timer data
+RAM_LONG: 	.byte 1	;full motor power control pulse width data from T1 lo-byte timer data
+
+RAM_SENSE:	.byte 1	;sensor data storage space to check very slow rotation
+RAM_POT:	.byte 1	;Storage for roundtime loop counter data storage space to check very slow rotation
+RAM_HYS:	.byte 1	;slow stick position jitter cancel hysterisis data storage 
+
+
+;***** Registers used by all programs
+;******Global variables used by routines
+.def	temp	=r16	;general scratch space
+.def	temp1	=r17	;Mostly used for motor drive pattern. In sound gen. rtoutine, used for general scratch space, 
+.def	temp2	=r18	;general scratch space, used in INT1 interrupt routine. Do not care the using temp in T1 interrupt.
+.def	stack	=r19	;store SREG space for interrupt
+.def	on_time	=r20	;on-duty timing data register
+.def	r_sense	=r21	;get rotate data from sensors and store here
+.def	timset	=r22	;Flag for timer over flow
+.def	phase_tim_count =r23	;motor phase timing counter
+.def	duty_time =r24	;Duty time setting register for timer0
+;XL is used as scratch space
+;XH is used as scratch space
+;YH is used argument in each sub-routine
+
+
+.include "2313def.inc"
+;****Source code***************************************************
+.cseg					;CODE segment
+.org 0
+		rjmp Reset		;Reset handler
+		nop			;EXT_INT0 unused ext. interrupt Request0
+		rjmp EXT_INT1		;EXT_INT1 is used ext. interrupt Request1		
+		nop			;TIM_CAPT1 Timer/Counter1 Capture Event interrupt	
+		nop			;TIM_CAPM1 Timer/Counter1 Capture Match interrupt
+		nop			;TIM_OVF1 Timer/Counter1 overflow interrupt
+		rjmp TIM_OVF0		;TIM_OVF0 Timer/Counter0 overflow interrupt
+		nop			;UART_RX, UART Rx Complete
+		nop			;UART_DRE, UART Data register Empty
+		nop			;UART_TXC, UART Tx Complete
+		nop			;ANA_COMP Analogue comparator interrupt
+
+RESET:		ldi temp, 0xdf		;set stack pointer on adrs. $DF in SRAM area
+		out SPL,temp
+		
+		rcall Reset_handler	;all register_settings 
+ 		sei
+ 		rcall get_control_pulse
+		rcall get_shortest_pulse
+		rcall get_longest_pulse
+		rcall get_motor_off_pulse
+		rcall start_up_setting
+;---------------------------------
+
+start_rotate:	ldi phase_tim_count,phase_repeat
+		sts ph_count,phase_tim_count		;TIMER0 interrupt repeat timing setting
+		;beep routine charged up the P power pumps. 
+			
+		clr on_time
+
+		ldi temp1,0				;Turn off all output FETs
+		ldi temp,(1<<TOIE0)	;Enable Timer0 overflow interrupt for output duty power control
+		out TIMSK,temp		
+		rcall output_on_timer
+		ldi temp,(0<<TOIE0)	;Disable Timer0 overflow interrupt for output duty power control
+		out TIMSK,temp	
+		
+		rcall get_control_data			;Start pulse duty depends on this stick position
+
+;---------------------------------
+;*** MAIN ROUTINE ***
+st_phase0:	ldi temp1,0b01100000		;Turn the UN,	VP,	W-off Output FETs
+		rjmp control_sequence 		;Sense the rotor position
+st_phase1:	ldi temp1,0b01001000		;Turn the UN,	V-off,	WP 
+		rjmp control_sequence 		;
+st_phase2:	ldi temp1,0b00011000		;Turn the U-off,VN,	WP 
+		rjmp control_sequence
+st_phase3:	ldi temp1,0b10010000		;Turn the UP,	VN,	WP-off 
+		rjmp control_sequence
+st_phase4:	ldi temp1,0b10000100		;Turn the UP,	V-off,	WN 
+		rjmp control_sequence
+st_phase5:	ldi temp1,0b00100100		;Turn the U-off,VP,	WN 
+
+control_sequence:
+		ldi temp,(1<<TOIE0)	;Enable Timer0 overflow interrupt for output duty power control
+		out TIMSK,temp		
+		rcall output_on_timer		;call OUTPUT on timing pulse generator routine		
+		ldi temp,(0<<TOIE0)	;Disable Timer0 overflow interrupt for output duty power control
+		out TIMSK,temp
+		
+		rcall get_control_data
+		rcall get_sense			;get rotor position	
+		
+st_phase0a:	cpi r_sense,0b00000101	
+		breq st_phase3		;keep sync
+st_phase1a:	cpi r_sense,0b00000001
+		breq st_phase4
+st_phase2a:	cpi r_sense,0b00000011
+		breq st_phase5
+st_phase3a:	cpi r_sense,0b00000010
+		breq st_phase0
+st_phase4a:	cpi r_sense,0b00000110
+		breq st_phase1
+st_phase5a:	cpi r_sense,0b00000100
+		breq st_phase2
+
+
+
+
+
+sense_rotate0:	ldi XL, 128		;check stop rotation or rotor cross position in this about 65k x 1uS(6.5mS)timer
+sense_rotate1:		ldi temp,0xff
+sense_rotate2:		dec temp			;Sense again, if the rotor is cross point, very slow, stopping.
+			breq sense_rotate3
+				rcall get_sense			;get rotor position
+				cpi r_sense,0b00000000		;stop or sense at 3-phase cross point	
+				breq sense_rotate2		;NEED THE OFFSET OF the rotation sensor comparator		
+				cpi r_sense,0b00000111		;stop or sense at 3-phase cross point	
+				breq sense_rotate2
+			rjmp st_phase0a		;Sensed the rotation and keep sync.
+sense_rotate3:	dec XL
+		brne sense_rotate1 
+
+st_stop:	inc phase_tim_count
+		inc phase_tim_count 		;Increase the starting pulse length for more slow starting round.
+
+		clc
+		cpi phase_tim_count,phase_repeat
+		brlo run_slow			;Branch if lower
+		ldi phase_tim_count,phase_repeat	;Set to slowest control timing
+		;ldi phase_tim_count,0xff 	;Set to slowest control timing
+		
+run_slow:	sts ph_count,phase_tim_count	;TIMER0 interrupt repeat timing setting to start	
+		cpi on_time,0			;Stick off?
+		breq restart_control		;
+		
+		ldi on_time,0xfe		;Full power restart in just one phase only
+		
+restart_control:cpi temp1,0b00100100		;if the round stops,
+		breq st_phase0			;then next output phase to keep tring rounds
+		cpi temp1,0b10000100
+		breq st_phase1		
+		cpi temp1,0b10010000
+		breq st_phase2		
+		cpi temp1,0b00011000
+		breq st_phase3
+		cpi temp1,0b01001000
+		breq st_phase4
+		cpi temp1,0b01100000	
+		breq st_phase5		
+
+start_problem:	rjmp start_rotate	;Something wrong to keep continue
+
+
+;------------------------------------------------
+get_control_data:
+_no_signal_check:rcall no_signal_check
+			cpi YH,0xa		;find Rx signal?
+			breq _sense_lo_batt 	;"yes"
+		
+			rcall brake_out
+			rcall start_up_setting
+		rjmp motor_off
+
+_sense_lo_batt:	rcall sense_lo_batt		;battery low?
+		rcall get_rx_pulse		;Duty setting Also, this routine includes the pulse width check function
+		rcall sense_rotor_position	;This routine includes sensor miss-sensing detect function at very slow rotation
+		ret				;IMPORTANT. "set_off_timer" timing adjusts sensing timing in control
+
+
+;-----------------------------------
+;*** Interrupt routines ***
+TIM_OVF0:	in stack,SREG		;While this routine uses branch instruction, the status may be changed.
+
+		sts temp0,temp
+		
+			lds temp,ph_count	;phase_max is the minimum timing. 
+			dec temp
+			breq set_repeat
+			sts ph_count,temp
+						 
+			out TCNT0,duty_time	;set repeat
+		
+				in temp2,GIFR		;EXT-INT1 double interrupts?
+				andi temp2,0b10000000	;checking the INT1 interrupt flag
+				brne EXT_INT10
+			
+			lds temp,temp0
+			out SREG,stack
+		
+		reti
+		
+set_repeat:		inc timset		;Turn on timer over flow flag
+			clc
+			cpi phase_tim_count,phase_max
+			brsh L1
+			ldi phase_tim_count,phase_max
+L1:			sts ph_count,phase_tim_count
+			 
+			
+				in temp2,GIFR		;EXT-INT1 double interrupts?
+				andi temp2,0b10000000	;checking the INT1 interrupt flag
+				brne EXT_INT10		
+
+		lds temp,temp0
+		out SREG,stack	
+		
+		reti
+;------------
+EXT_INT10:	ldi temp2,0		;
+		out TCNT1H,temp2	;Clear T1 16bit timer/counter
+		out TCNT1L,temp2	;input pulse width will be counted and captured by falling edge of INT1
+		
+		out GIFR,temp2		;Clear INT1 int. flag register
+				
+		lds temp,temp0
+		out SREG,stack
+		reti
+	
+;-----------------------------------
+EXT_INT1:	in stack,SREG		;While this routine uses branch instruction, the status may be changed.
+		sts temp0,temp
+		
+			ldi temp2,0		;
+			;out PORTB,temp2	;Output FETs all off for brake point test only	
+			out TCNT1H,temp2	;Clear T1 16bit timer/counter
+			out TCNT1L,temp2	;input pulse width will be counted and captured by falling edge of INT1
+
+				in temp2,TIMSK		;TIM_OVF0 enable interrupt?			
+				andi temp2,0b00000010	;checking the timer0 TOIE0 mask 
+				breq ext1_ret
+			
+				in temp2,TIFR		;TIM_OVF0 double interrupts?
+				andi temp2,0b00000010	;checking the timer0 overflow flag
+				brne TIM_OVF00
+
+ext1_ret:	lds temp,temp0
+		out SREG,stack
+		reti
+;------------		
+TIM_OVF00:		lds temp,ph_count	;(2)timing by phase_tim_count. 
+			dec temp		;(1)
+			breq set_repeat00
+			sts ph_count,temp	;(2)
+
+			out TCNT0,duty_time	;(1)set repeat
+		
+		ldi temp2,0		;(1)
+		out TIFR,temp2		;(1)clear timer int. flags	
+		
+		lds temp,temp0
+		out SREG,stack
+		
+		reti
+		
+set_repeat00:		inc timset		;(1)Turn on timer over flow flag
+						clc
+			cpi phase_tim_count,phase_max
+			brsh L2
+			ldi phase_tim_count,phase_max
+L2:			sts ph_count,phase_tim_count
+
+			
+		ldi temp2,0		;(1)
+		out TIFR,temp2		;(1)clear timer int. flags	
+				
+		lds temp,temp0		
+		out SREG,stack		
+		
+		reti
+
+
+
+;---------------------------------
+;**************** motor speed control start routine ********************
+start_up_setting:	clr on_time		;initial power must be 0
+			ldi temp,hys_hi		;avoid jitter of control input data
+			sts RAM_HYS,temp	;by setting the slow speed hysterisis 
+			ret
+;-----------------------------------
+output_on_timer:
+set_off_check:		cpi on_time,0		;Control off?
+			breq free_run_tim
+					
+set_on_timer:		mov duty_time,on_time
+			com duty_time		;on_time=$FF-(on_time) until overflow
+			out TCNT0,duty_time
+
+st_pulse_out:		rcall P_FET_on_fast
+			out PORTB,temp1		;Turn on/off the U,V,W Output transistor
+
+			clr timset		;Clear timer0 flag		
+watch_tim_over:		sbrs timset,0		;Skip here if timer0 overflow is occurred		
+			rjmp watch_tim_over
+			
+free_run_tim:				
+set_off_timer:	rcall P_FET_off_fast		
+		mov duty_time,on_time
+		out TCNT0,duty_time	;Do not confuse. off-timing is on_time data, until over flow!
+
+tim_set:	clr timset		;Clear timer0 timeover flag			
+off_phase:	sbrs timset,0		;Skip if timer0 overflow is occurred
+		rjmp off_phase
+
+get_sense:	in r_sense,PIND
+		andi r_sense,0b00000111	;get rotate data from sensor circuit
+		ret
+
+;---------------------------------
+P_FET_off_fast:		in temp,PORTB		;Turn of all of output FET with photo cuppler delay compasation  
+			andi temp,0b01010111	;Turn off setting for the UP,VP,WP P-site Output FETs
+Pch_deley:		out PORTB,temp		;'02/01/11 Photo cupller delay compensation, 2uS for Toshiba TLP521
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp		
+			out PORTB,temp
+			out PORTB,temp				
+						
+			clr temp
+			out PORTB,temp		;
+		ret
+		
+P_FET_on_fast:		mov temp,temp1		;Turn of all of output FET with photo cuppler delay compasation  
+			andi temp,0b10101011	;Turn off setting for the UP,VP,WP P-site Output FETs
+
+			out PORTB,temp		;'02/01/17 Photo cupller delay compensation, 2uS for Toshiba TLP521
+			out PORTB,temp		;Turn on the UP,VP,WP P-site Output FETs
+			out PORTB,temp	
+			out PORTB,temp
+			out PORTB,temp		
+			
+			out PORTB,temp	
+			out PORTB,temp
+			out PORTB,temp		
+			out PORTB,temp	
+			out PORTB,temp
+			
+			out PORTB,temp	
+			out PORTB,temp
+			out PORTB,temp		
+			out PORTB,temp	
+			out PORTB,temp
+			
+			out PORTB,temp	
+			out PORTB,temp
+			out PORTB,temp		
+			out PORTB,temp	
+			out PORTB,temp
+			
+			out PORTB,temp1		;Output FETs all off for brake point test
+		ret
+;---------------------------------
+;*** Reset handler ***
+;*** to provide initial port, timer and interrupt setting up
+Reset_handler:	clr temp
+		out PORTB,temp		;Output FETs all off
+		
+		ser temp		;set register temp=R16 to "11111111"  
+		out DDRB,temp		;initialize port B as all Outputs
+		
+		ldi temp,0x00		;clear temp
+		out DDRD,temp		;initialize portD as all Inputs
+
+		;Timer0 internal clock divide for output motor switching duty resolution 
+		ldi temp,(1<<CS00)		;CLK/1		
+		;ldi temp,(1<<CS01)		;CLK/8
+		;ldi temp,(1<<CS01)+(1<<CS00)	;CLK/64
+		;ldi temp,(1<<CS02)		;CLK/256
+		out TCCR0,temp
+		
+		;Disable Timer0 overflow interrupt for output duty power control initialize 
+		ldi temp,(0<<TOIE0)
+		out TIMSK,temp
+		
+		
+		
+		
+		;Timer1 Timer/Counter1 Control ResisterA(TCCR1A)
+		clr temp			;no output on pin15(OC1), Off the PWM operation
+		out TCCR1A,temp		
+		
+		;Timer1 internal clock divide for input power control digital prop. pulse width measuring 
+		;Also, Input Timer1 counts data capture Edge select is "Falling Edge" by ICES1="0"
+		;ldi temp,(1<<CS10)		;CLK/1		
+		;ldi temp,(1<<CS11)		;CLK/8
+		;ldi temp,(1<<CS11)+(1<<CS10)+(1<<ICNC1)+(0<<ICES1) ;CLK/64, 6.4uS resolution + Noise canceller for pin11 ICP 
+		ldi temp,(1<<CS11)+(1<<CS10)+(0<<ICNC1)+(0<<ICES1) ;CLK/64, 6.4uS resolution	
+		;ldi temp,(1<<CS12)		;CLK/256
+		;ldi temp,(1<<CS10)+(1<<CS12)	;CLK/1024		
+		;ldi temp,(1<<CS11)+(1<<CS12)	;EXT pin T1, falling edge
+		;ldi temp,(1<<CS11)+(1<<CS10)+(1<<CS12)	;EXT pin T1, rising edge
+	 	out TCCR1B,temp
+
+		;Interrupt input setting for digital prop. pulse input
+		;ldi temp,(1<<ISC11)		;the falling edge of INT1 generates IRQ1
+		ldi temp,(1<<ISC11)+(1<<ISC10)	;the rising edge of INT1 generates IRQ1
+		out MCUCR,temp
+		
+		ldi temp,(1<<INT1)
+		out GIMSK,temp		;Enable INT1 interrupt for Digital Prop. input line
+	
+		ret
+;---------------------------------		
+get_control_pulse:
+		rcall single_beep	;initial powered sound
+		rcall pulse_in_test	;wait the one sample of control pulse. Possibly noise when TX powered.
+		rcall pulse_in_test	;wait the one sample of control pulse 
+		rcall pulse_in_test	;wait the one sample of control pulse 
+				
+			rcall pulse_width_check
+			lds temp,correct_pulse_width 	;test control input pulse width by this flag. 0:incorrect, 1:correct
+			cpi temp,1			;correct?
+			brne get_control_pulse		;No. incorrect
+		
+		ret		
+;---------------------------------
+get_shortest_pulse: rcall wait_2sec
+		rcall get_T1_data
+store_short_pulse:
+		lds temp,RAM_TCNT1H	;get T1 hi byte data
+		cpi temp,0
+		brne get_shortest_pulse	;short not enough
+		
+		lds temp,RAM_TCNT1L	;Get motor off control pulse width
+			clc
+			cpi temp,uS1100		;Shorter than 1100uS?
+			brsh get_shortest_pulse	;short not enough
+
+			cpi temp,uS800		;Shorter than 800uS?
+			brmi get_shortest_pulse	;Too short	
+
+		inc temp		;get digital 1 digit margin
+		inc temp		;get trim 1 digit margin
+		inc temp		;get 1 digit margin
+		inc temp		;get 1 digit margin
+		
+			cpi temp,0x81		;RAM_SHORT must be more than $80 to avoid more than 8 bit subtract calculate
+			brmi get_shortest_pulse
+		
+		sts RAM_SHORT,temp	;Store motor off control pulse width data
+		rcall po_pi
+		ret
+
+
+
+
+
+
+;---------------------------------
+get_longest_pulse:rcall wait_2sec
+		rcall wait_2sec
+		;rcall pulse_width_check
+		rcall get_T1_data
+store_long_pulse:
+		lds temp,RAM_TCNT1H	;get T1 hi byte data
+		cpi temp,1
+		brne get_longest_pulse	;long not enough
+		
+		lds temp,RAM_TCNT1L	;Get motor full power control pulse width
+		cpi temp,uS1900L	;longer than 1900uS?
+		brmi get_longest_pulse	;long not enough
+		clc
+		cpi temp,uS2200L	;longer than 2200uS?
+		brsh get_longest_pulse	;Too long
+		;brpl get_longest_pulse	;Too long
+		
+		dec temp		;get digital 1 digit margin
+		dec temp		;get trim 1 digit margin
+		dec temp		;get trim 1 digit margin
+		sts RAM_LONG,temp	;Store motor full power control pulse width data
+
+		rcall po_pi
+		rcall po_pi
+		
+		ret
+;---------------------------------
+get_motor_off_pulse: rcall wait_2sec
+		rcall pulse_width_check
+
+		lds temp,correct_pulse_width 	;test control input pulse width by this flag. 0:incorrect, 1:correct
+		cpi temp,1			;correct?
+		brne get_motor_off_pulse	;No. incorrect
+
+		lds temp,RAM_TCNT1H	;get T1 hi byte data
+		cpi temp,0
+		brne get_motor_off_pulse	;Is the TX stick position motor_off?
+		
+		lds temp,RAM_TCNT1L	;Get motor off control pulse width
+		lds ZH,RAM_SHORT	;ZH is used as just temporary register	
+		clc
+		cp temp,ZH		;Is the TX stick motor off position?
+		;brpl get_motor_off_pulse	;short not enough
+		brsh get_motor_off_pulse	;short not enough
+		
+		rcall po_pi
+		rcall po_pi
+		rcall po_pi
+
+		ret
+;-----------------------------------		
+no_signal_check:in r_sense,PIND		;
+		andi r_sense,0b01000000	;get digital prop. input pulse on pin11(PD6)	
+		mov XH,r_sense		;HX is just scratch
+		;brne sense_lo_batt	;pulse is "H", then should not read T1 Timer/Counter 
+		
+			in temp,TCNT1L		;get T1 law lo-byte timer data from T1 timer
+			in temp,TCNT1H		;get T1 law hi-byte timer data from T1 timer
+				
+		in r_sense,PIND		;
+		andi r_sense,0b01000000	;get digital prop. input pulse on pin11(PD6)
+		
+		cp XH,r_sense
+		breq mS400_check
+		brpl continue_run	;ignore the data at "H" to "L" falling edge of T1 capture timing as spec. says	
+
+mS400_check:	clc
+		cpi temp,0xfe		;no-signal over 6.4uS * 255 * 255 = 400mS?
+		brsh braking		;stop the motor
+
+continue_run:	ldi YH,0xa
+		ret
+
+braking:	ldi YH,0xb
+		ret
+
+		
+;------------------------------------------------				
+brake_out:	ldi temp,0b01010100	;motor Brake out 
+		out PORTB,temp
+
+		rcall pulse_in_test	;wait the one sample of control pulse. Possibly noise when TX powered.
+		rcall pulse_in_test	;wait the one sample of control pulse 
+		rcall pulse_in_test	;wait the one sample of control pulse 
+		ret
+;---------------------------------
+sense_lo_batt:	in temp,PIND		;
+		andi temp,0b00100000	;get power voltage comparator input on pin9(PD5)	
+		breq get_rx_pulse_	;
+		
+about_50mS_tim:	ldi temp,0		;motor free run 
+		out PORTB,temp
+		
+		rcall pulse_in_test	;wait the one sample of control pulse.
+		rcall pulse_in_test	;wait the one sample of control pulse 
+		rcall pulse_in_test	;wait the one sample of control pulse 
+		
+re_check_it:	in temp,PIND		;
+		andi temp,0b00100000	;get power voltage comparator input on pin9(PD5)	
+		breq get_rx_pulse_	;
+
+really_low:	ldi temp,0		;motor free run 
+		out PORTB,temp
+		
+re_start1:	ldi phase_tim_count,phase_repeat ;Set starting 3 phase slow frequency
+		sts ph_count,phase_tim_count
+		
+		ldi temp,255		
+wait_a_few_sec:
+			rcall pulse_in_test	;wait the one sample of control pulse.
+			rcall pulse_in_test	;wait the one sample of control pulse 
+			rcall pulse_in_test	;wait the one sample of control pulse 
+		dec temp		;may 3-5 second
+		brne wait_a_few_sec
+
+		rcall single_beep
+
+final_test:	in temp,PIND		;
+		andi temp,0b00100000	;get power voltage comparator input on pin9(PD5)	
+		brne final_test
+		
+		rcall single_beep		;ready go
+
+check_stick_off:rcall get_rx_pulse
+		cpi on_time,0		;is the stick position power-off?
+		brne check_stick_off
+
+get_rx_pulse_:	ret
+
+;---------------------------------
+;*** This routine catches the rotor position data
+sense_rotor_position:
+
+		ldi temp,(1<<TOIE0)	;Enable Timer0 overflow interrupt for output duty power control
+		out TIMSK,temp		
+
+;normal_timing:	rcall set_off_timer	;IMPORTANT! wait a little time to compensate sensor circuit response time 
+;		rcall set_off_timer
+;reduce_timing:	rcall set_off_timer	;Whole control timing must be adjusted here and consider power limit
+		
+		ldi temp,(0<<TOIE0)	;Disable Timer0 overflow interrupt for output duty power control
+		out TIMSK,temp	
+		
+				
+duty_setting:		lds temp,RAM_duty
+			clc
+			cp on_time,temp
+			brsh set_control_duty 	;Branch if same or higher
+			inc on_time		;Accelate with step by step to limit power current 
+			rjmp check_max_duty
+
+set_control_duty:	;dec on_time		;**************************
+			mov on_time,temp	;De-accelerate immediately
+						
+check_max_duty:		clc
+			cpi on_time,duty_max	;power limiter 
+			brsh set_duty_limit 
+			rjmp dec_phase_tim
+
+set_duty_limit:		ldi on_time,duty_max
+			
+			
+dec_phase_tim:		lds temp,RAM_POT	;'02/02/16
+			cp temp1,temp		;RAM_POT has previous rotor control data(temp1)
+			breq same_position	;Rotor position is not rotated, then keep the power timing control 
+			
+			sts RAM_POT,temp1
+
+			dec phase_tim_count	;sampling speed up(reduce the Timer0 frame timing) step by step
+			
+same_position:		clc
+			cpi phase_tim_count,phase_max
+			brsh keep_speed
+
+			ldi phase_tim_count,phase_max
+keep_speed:		ret
+			
+
+;---------------------------------
+get_rx_pulse:		rcall pulse_width_check
+			lds temp,correct_pulse_width 	;test control input pulse width by this flag. 0:incorrect, 1:correct
+			cpi temp,1			;correct?
+			brne noise_detect		;No. incorrect
+
+			lds temp,RAM_TCNT1H	;get T1 hi byte data
+			cpi temp,0
+			breq slow_pulse		;Is the TX stick position slow?
+
+hi_pulse:				lds temp,RAM_TCNT1L
+					lds ZH,RAM_LONG		;ZH is used as just temporary register
+		
+					clc
+					cp temp,ZH		;Is the TX stick motor full on position?
+					brsh max_power		
+		
+					lds ZH,RAM_SHORT	;get minimum pulse width
+					com ZH			;-(minimum pulse width)
+		
+					lds temp,RAM_TCNT1L
+					add temp,ZH		;+input pulse width= value of duty data
+					brmi max_power		;data will be x2 by "lsl"
+					rjmp set_on_duty
+					;lsl temp
+					;sts RAM_DUTY,temp
+		
+noise_detect:		ret			;
+			
+
+
+
+slow_pulse:		lds temp,RAM_TCNT1L	;
+			lds ZH,RAM_SHORT	;Get motor off control pulse width	
+			sub temp,ZH		;Is the TX stick motor off position?
+			brmi motor_off
+			breq motor_off
+		
+		
+set_on_duty:			lsr temp		;erase one digit jitter
+				lsl temp
+			
+
+
+
+
+;*****
+;***** this routine makes hysterisis at starting only to avoid very slow start-up sequence
+;*****			
+hysterisis_set:		;**************************
+			;ldi temp,30		;TEST ONLY
+			;**************************
+			
+debug:				lds ZH,RAM_HYS		
+				clc
+				cp temp,ZH
+				brsh set_hys_lo
+		
+set_hys_hi:			ldi ZH,hys_hi
+				sts RAM_HYS,ZH		;hysterisis threshold to avoid jitter of control input data	
+				;rjmp set_duty
+				rjmp motor_off
+
+set_hys_lo:			ldi ZH,hys_lo
+				sts RAM_HYS,ZH		;hysterisis threshold to avoid jitter of control input data
+				rjmp slow_run
+				
+slow_run:		
+
+set_duty:		lsl temp
+			sts RAM_DUTY,temp
+			ret
+
+
+motor_off:		clr on_time
+			sts RAM_DUTY,on_time		
+			ret
+
+max_power:		ldi temp,0xff
+			sts RAM_DUTY,temp
+			;ldi on_time,0xff	;test only
+			ret
+
+;------------------------------------------------
+pulse_width_check: rcall get_T1_data
+		
+		lds temp,RAM_TCNT1H		
+		cpi temp,0x01		;Check the longest in-put control data.
+		breq long_pulse_test	;over 1.63mS?
+		cpi temp,0
+		breq short_pulse_test	;less than 0.8mS?
+		rjmp wait_control_in 	;too long incorrect pulse width(over 2.3mS)
+				
+long_pulse_test: lds temp,RAM_TCNT1L 	;get input power control pulse width low-byte data from INT1
+		clc
+		cpi temp,uS2200L	;Check over 2200uS long in-put control data.
+		;cpi temp,0x30		;Check the longest in-put control data.
+		;brpl wait_control_in 	;too long incorrect pulse width(over 2.3mS)
+		brsh wait_control_in 	;too long incorrect pulse width(over 2.3mS)
+		rjmp OK_input
+
+short_pulse_test:lds temp,RAM_TCNT1L 	;get input power control pulse width low-byte data from INT1
+		cpi temp,uS800		;too short incorrect pulse width(less than 0.9mS)?
+		;cpi temp,0xA0		;too short incorrect pulse width(less than 0.9mS)?
+		brmi wait_control_in 	;bad data
+		
+OK_input:	ldi temp,1
+		sts correct_pulse_width,temp ;OK. set "OK" Flag to RUN 
+		ret
+
+wait_control_in:clr temp
+		sts correct_pulse_width,temp ;Incorrect pulse width measured. Set bad Flag
+		ret
+;------------------------------------------------
+get_T1_data:	in temp,PIND		;This routine gets the pulse width counter(T1) capture register data
+		andi temp,0b01000000	;get digital prop. input pulse on pin11(PD6)	
+		brne input_hi		;avoid data up-date by falling edge of PD6 as chatter
+		
+		;interrupt handle routine	;Disable all interrupts to avoid T1 up-date chattering
+		
+		in temp,ICR1L		;get T1 timer data from T1 capture register
+		sts RAM_TCNT1L,temp	;Store to the RAM space to calculate
+		in temp,ICR1H		;get input power control pulse width hi-byte data from T1
+		sts RAM_TCNT1H,temp	;Store to the RAM space to calculate
+
+		 			;enable all interrupts
+input_hi:	ret		
+;------------------------------------------------
+wait_2sec:	ldi temp,80		;register r_sense can be used in no-rotation mode.	
+wait_80_frame:	rcall pulse_in_test	;wait about 2 sec. by number of sampling control input pulse frame 
+		dec temp
+		brne wait_80_frame
+		ret
+;---------------------------------
+pulse_in_test:	in r_sense,PIND		;This routine checks the pulse width counter(T1)
+		andi r_sense,0b01000000	;get digital prop. input pulse on pin11(PD6)	
+		breq pulse_in_test
+		
+input_1:	in r_sense,PIND
+		andi r_sense,0b01000000	;get digital prop. input pulse on pin11(PD6)	
+		brne input_1
+
+input_0:	nop			;ensure the ICP T1 capture time
+		;clr temp
+		;out PORTB,temp		;Output FETs all off for brake point test only
+		ret			;get falling edge of input pulse, Then SEE the T1 latched data
+;-----------------------------------
+single_beep:	ldi temp,50		;Set Sound freq.
+beep_0:		sts temp3,temp		;Store into the sound freq. data space
+		
+		ldi temp,30		;beeping timer setting
+beep1b:		sts RAM_SENSE,temp
+		
+		rcall beep_on 
+		
+		lds temp,RAM_SENSE
+		dec temp
+		brne beep1b		
+		ret
+;-----------------------------------
+w_beep:		rcall single_beep
+		
+		ldi temp,100		;silence timer setting
+silence:	sts RAM_SENSE,temp
+			clr temp
+			rcall silent
+		lds temp,RAM_SENSE
+		dec temp
+		brne silence
+				
+		rcall single_beep
+		ret
+;-----------------------------------
+po_pi:		rcall single_beep
+
+		ldi temp,20
+		rcall silent
+
+		ldi temp,40	;"pi" freq. data		
+		rcall beep_0		
+		ret
+;---------------------------------
+beep_on:			ldi temp1,0b01100000	;Turn the UN,	VP,	W-off Output transistor
+				out PORTB,temp1		;Turn on/off the UN,	VP,	W Output transistor
+				rcall little_timer
+				
+				ldi temp1,0b10000100	;Turn the UP,	V-off,	WN Output transistor
+				out PORTB,temp1		;Turn on/off the UN,	VP,	W Output transistor
+				rcall little_timer
+				
+				ldi temp1,0b00011000	;Turn the U-off,VN,	WP Output transistor
+				out PORTB,temp1		;Turn on/off the UN,	VP,	W Output transistor
+				rcall little_timer
+				
+				ldi temp1,0b10010000	;Turn the UP,	VN,	WP-off Output transistor
+				out PORTB,temp1		;Turn on/off the UN,	VP,	W Output transistor
+				rcall little_timer
+				
+				ldi temp1,0b00100100	;Turn the U-off,VP,	WN Output transistor				
+				out PORTB,temp1		;Turn on/off the UN,	VP,	W Output transistor
+				rcall little_timer				
+
+				ldi temp1,0b01001000	;Turn the UN,	V-off,	WP Output transistor
+				out PORTB,temp1		;Turn on/off the UN,	VP,	W Output transistor
+				rcall little_timer
+			rcall silent
+		ret
+
+
+
+silent:			clr temp1		;Turn off the U,	VP,	W Output transistor
+			out PORTB,temp1
+			
+			lds temp1,temp3		;beep off-duty timer data to reduce the waste current. 
+no_tone:			rcall little_timer
+				rcall little_timer
+				rcall little_timer
+				rcall little_timer
+			dec temp1
+			brne no_tone
+			ret
+
+little_timer:			lds temp,temp3		;Sound on Freq. data
+beep_on_tim:			dec temp
+				brne beep_on_tim
+				ret
+
